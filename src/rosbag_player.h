@@ -26,18 +26,26 @@ public:
     virtual void load(const rviz::Config& config);
     virtual void save(rviz::Config config) const;
 
-    void loadFile();
+protected:
+    void openBagFile();
     void playCallback();
-    void sliderMoved();
+    void moveBagTo(int new_pos);
+    void updateSlider(ros::Time time);
+
+    ros::Publisher& getPublisher(const rosbag::MessageInstance& msg);
 
 protected:
+    static const int queue_size_ = 1; // TODO
+
     QPushButton *load_button_, *ctrl_button_;
     QSlider* slider_;
     QFileInfo bag_file_;
     QTimer play_timer_;
+    QLabel* slider_label_;
     rosbag::Bag bag_;
     std::shared_ptr<rosbag::View> bag_view_;
-    rosbag::View::iterator msg_;
+    rosbag::View::iterator msg_, last_msg_;
+    ros::WallTime last_pub_time_;
     std::map<std::string, ros::Publisher> topic_pub_;
 };
 

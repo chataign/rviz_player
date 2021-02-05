@@ -1,32 +1,3 @@
-/*
- * Copyright (c) 2011, Willow Garage, Inc.
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *     * Redistributions of source code must retain the above copyright
- *       notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimer in the
- *       documentation and/or other materials provided with the distribution.
- *     * Neither the name of the Willow Garage, Inc. nor the names of its
- *       contributors may be used to endorse or promote products derived from
- *       this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
-
 #include <stdio.h>
 
 #include <QFileDialog>
@@ -40,6 +11,16 @@
 
 namespace rviz_rosbag_player
 {
+QString formatDuration(ros::Duration duration)
+{
+    int hours = duration.toSec() / 3600;
+    int mins = (duration.toSec() - hours * 3600) / 60;
+    int secs = duration.toSec() - hours * 3600 - mins * 60;
+
+    char time_str[20];
+    snprintf(time_str, 20, "%02d:%02d:%02d", hours, mins, secs);
+    return QString::fromStdString(time_str);
+}
 
 RosbagPlayer::RosbagPlayer(QWidget* parent)
   : rviz::Panel(parent)
@@ -49,65 +30,141 @@ RosbagPlayer::RosbagPlayer(QWidget* parent)
     ctrl_button_ = new QPushButton("start/stop");
     ctrl_button_->setFixedWidth(100);
     slider_ = new QSlider(Qt::Horizontal);
+    slider_->setTracking(false);
+    slider_->setMinimum(0);
+    slider_->setMaximum(1000);
+    slider_label_ = new QLabel;
+    slider_label_->setFixedWidth(80);
+
+    play_timer_.setInterval(10);
 
     QHBoxLayout* layout = new QHBoxLayout;
     layout->addWidget(load_button_);
     layout->addWidget(ctrl_button_);
     layout->addWidget(slider_);
+    layout->addWidget(slider_label_);
     setLayout(layout);
 
-    connect(load_button_, &QPushButton::clicked, this, &RosbagPlayer::loadFile);
+    connect(slider_, &QSlider::sliderPressed, [this]() { play_timer_.stop(); });
+    connect(slider_, &QSlider::sliderReleased, [this]() { play_timer_.start(); });
+    connect(load_button_, &QPushButton::clicked, this, &RosbagPlayer::openBagFile);
+    connect(&play_timer_, &QTimer::timeout, this, &RosbagPlayer::playCallback);
+    connect(slider_, &QSlider::valueChanged, this, &RosbagPlayer::moveBagTo);
 
     connect(ctrl_button_, &QPushButton::clicked, [this]() {
-        if (play_timer_.isActive())
-        {
-            play_timer_.stop();
-        }
-        else
-        {
-            play_timer_.start(1000);
-        }
+        play_timer_.isActive() ? play_timer_.stop() : play_timer_.start();
     });
 }
 
-void RosbagPlayer::loadFile()
+void RosbagPlayer::openBagFile()
 {
     bag_file_ =
       QFileDialog::getOpenFileName(this, tr("Open bag"), bag_file_.dir().path(), tr("ROS bag file (*.bag)"));
 
     ROS_INFO_STREAM("loading file=" << bag_file_.absoluteFilePath().toStdString());
-    bag_.close();
     bag_.open(bag_file_.absoluteFilePath().toStdString(), rosbag::bagmode::Read);
-
     bag_view_ = std::make_shared<rosbag::View>(bag_);
+    ROS_INFO("bag duration=%.0fs", (bag_view_->getEndTime() - bag_view_->getBeginTime()).toSec());
     msg_ = bag_view_->begin();
-
-    connect(&play_timer_, &QTimer::timeout, this, &RosbagPlayer::playCallback);
-    connect(&slider_, &QSlider::valueChanged, this, &RosbagPlayer::sliderMoved);
+    last_msg_ = msg_;
 }
 
-void RosbagPlayer::sliderMoved() {}
+void RosbagPlayer::moveBagTo(int new_pos)
+{
+    if (!bag_view_)
+    {
+        return;
+    }
+
+    float new_percent = (new_pos - slider_->minimum()) / float(slider_->maximum() - slider_->minimum());
+    ROS_INFO("slider moved: pos=%d percent=%.1f", new_pos, new_percent);
+
+    ros::Time new_time =
+      bag_view_->getBeginTime() +
+      ros::Duration(new_percent * (bag_view_->getEndTime() - bag_view_->getBeginTime()).toSec());
+
+    if (msg_ == bag_view_->end() or new_time < msg_->getTime())
+    {
+        msg_ = bag_view_->begin();
+    }
+
+    ROS_INFO("new time=%.2f", new_time.toSec());
+
+    while (msg_->getTime() < new_time)
+    {
+        ++msg_;
+    }
+
+    last_msg_ = msg_;
+    updateSlider(msg_->getTime());
+}
+
+void RosbagPlayer::updateSlider(ros::Time new_time)
+{
+    if (!bag_view_)
+    {
+        return;
+    }
+
+    float bag_percent = (new_time - bag_view_->getBeginTime()).toSec() /
+                        (bag_view_->getEndTime() - bag_view_->getBeginTime()).toSec();
+
+    int slider_pos = slider_->minimum() + bag_percent * (slider_->maximum() - slider_->minimum());
+    // ROS_INFO("moving slider to percent=%.4f pos=%d", bag_percent, slider_pos);
+
+    slider_->setSliderPosition(slider_pos);
+    slider_label_->setText(formatDuration(new_time - bag_view_->getBeginTime()));
+}
+
+ros::Publisher& RosbagPlayer::getPublisher(const rosbag::MessageInstance& msg)
+{
+    auto pub_it = topic_pub_.find(msg.getTopic());
+
+    if (pub_it == topic_pub_.end())
+    {
+        ROS_INFO_STREAM("publishing topic=" << msg.getTopic());
+        ros::NodeHandle nh;
+        ros::AdvertiseOptions options(
+          msg.getTopic(), queue_size_, msg.getMD5Sum(), msg.getDataType(), msg.getMessageDefinition());
+        topic_pub_[msg.getTopic()] = nh.advertise(options);
+        pub_it = topic_pub_.find(msg.getTopic());
+    }
+
+    return pub_it->second;
+}
 
 void RosbagPlayer::playCallback()
 {
-    if (!bag_view_ or msg_ == bag_view_->end())
+    if (!bag_view_)
+    {
+        return;
+    }
+    if (msg_ == bag_view_->end())
     {
         ROS_INFO("reached end.");
         play_timer_.stop();
         return;
     }
-    auto pub_it = topic_pub_.find(msg_->getTopic());
-    if (pub_it == topic_pub_.end())
+
+    auto time_now = ros::WallTime::now();
+
+    if (last_msg_ != bag_view_->end())
     {
-        ROS_INFO_STREAM("topic=" << msg_->getTopic());
-        ros::NodeHandle nh;
-        ros::AdvertiseOptions options(
-          msg_->getTopic(), 10, msg_->getMD5Sum(), msg_->getDataType(), msg_->getMessageDefinition());
-        topic_pub_[msg_->getTopic()] = nh.advertise(options);
-        pub_it = topic_pub_.find(msg_->getTopic());
+        ros::WallDuration interval((msg_->getTime() - last_msg_->getTime()).toSec());
+
+        if (last_pub_time_ + interval > time_now)
+        {
+            ros::WallDuration sleep_time = (last_pub_time_ + interval) - time_now;
+            // ROS_INFO("sleep=%.4fs", sleep_time.toSec());
+            sleep_time.sleep();
+        }
     }
 
-    pub_it->second.publish(*msg_);
+    auto& pub = getPublisher(*msg_);
+    pub.publish(*msg_);
+    updateSlider(msg_->getTime());
+    last_msg_ = msg_;
+    last_pub_time_ = time_now;
     ++msg_;
 }
 
