@@ -4,8 +4,11 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPainter>
+#include <QPixmap>
 #include <QPushButton>
 #include <QVBoxLayout>
+
+#include <ros/package.h>
 
 #include "rosbag_player.h"
 
@@ -25,10 +28,20 @@ QString formatDuration(ros::Duration duration)
 RosbagPlayer::RosbagPlayer(QWidget* parent)
   : rviz::Panel(parent)
 {
-    load_button_ = new QPushButton("load");
-    load_button_->setFixedWidth(100);
-    ctrl_button_ = new QPushButton("start/stop");
-    ctrl_button_->setFixedWidth(100);
+    static const boost::filesystem::path pkg_path = ros::package::getPath("rviz_rosbag_player");
+
+    QPixmap play_icon((pkg_path / "icons/media-playback-start.png").c_str());
+    QPixmap pause_icon((pkg_path / "icons/media-playback-pause.png").c_str());
+    QPixmap eject_icon((pkg_path / "icons/media-eject.png").c_str());
+
+    load_button_ = new QPushButton;
+    load_button_->setIcon(QIcon(eject_icon));
+    load_button_->setIconSize(eject_icon.size());
+    load_button_->setToolTip("load rosbag");
+    ctrl_button_ = new QPushButton;
+    ctrl_button_->setIcon(play_icon);
+    ctrl_button_->setIconSize(play_icon.size());
+    ctrl_button_->setToolTip("play/pause");
     slider_ = new QSlider(Qt::Horizontal);
     slider_->setTracking(false);
     slider_->setMinimum(0);
@@ -51,8 +64,19 @@ RosbagPlayer::RosbagPlayer(QWidget* parent)
     connect(&play_timer_, &QTimer::timeout, this, &RosbagPlayer::playCallback);
     connect(slider_, &QSlider::valueChanged, this, &RosbagPlayer::moveBagTo);
 
-    connect(ctrl_button_, &QPushButton::clicked, [this]() {
-        play_timer_.isActive() ? play_timer_.stop() : play_timer_.start();
+    connect(ctrl_button_, &QPushButton::clicked, [this, play_icon, pause_icon]() {
+        if (play_timer_.isActive())
+        {
+            play_timer_.stop();
+            ctrl_button_->setIcon(play_icon);
+            ctrl_button_->setIconSize(play_icon.size());
+        }
+        else
+        {
+            play_timer_.start();
+            ctrl_button_->setIcon(pause_icon);
+            ctrl_button_->setIconSize(pause_icon.size());
+        }
     });
 }
 
@@ -61,7 +85,14 @@ void RosbagPlayer::openBagFile()
     bag_file_ =
       QFileDialog::getOpenFileName(this, tr("Open bag"), bag_file_.dir().path(), tr("ROS bag file (*.bag)"));
 
+    if (bag_file_.completeSuffix() != "bag")
+    {
+        ROS_INFO_STREAM("invalid path=" << bag_file_.absoluteFilePath().toStdString());
+        bag_file_ = QFileInfo();
+        return;
+    }
     ROS_INFO_STREAM("loading file=" << bag_file_.absoluteFilePath().toStdString());
+    bag_.close();
     bag_.open(bag_file_.absoluteFilePath().toStdString(), rosbag::bagmode::Read);
     bag_view_ = std::make_shared<rosbag::View>(bag_);
     ROS_INFO("bag duration=%.0fs", (bag_view_->getEndTime() - bag_view_->getBeginTime()).toSec());
